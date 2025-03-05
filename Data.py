@@ -1,75 +1,176 @@
+'''import os
+import torch
 import pandas as pd
-from transformers import AutoTokenizer
-from torch.utils.data import Dataset
+import spacy
+import networkx as nx
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from transformers import AutoTokenizer
 
-# 파일 경로
-csv_file = "Data\WMT21_en_de.csv"
-
-# CSV 파일 읽기
+# -------------------------
+# 1. 파일 경로 설정 & 데이터 로드
+# -------------------------
+base_path = os.path.dirname(os.path.abspath(__file__))  
+csv_file = os.path.join(base_path, "Data", "WMT21_en_de.csv")
 df = pd.read_csv(csv_file)
 
-# 필요한 열 추출 (source, eTranslation)
+# 필요한 열 추출
 df = df[['source', 'eTranslation']]
 
-# 데이터 정제 함수
 def clean_sentence(sentence):
-    sentence = sentence.strip().lower()  # 소문자로 변환 및 공백 제거
-    return sentence
+    return sentence.strip().lower()
 
-# 데이터 정제 적용
 df['source'] = df['source'].apply(clean_sentence)
 df['eTranslation'] = df['eTranslation'].apply(clean_sentence)
 
-# 문장 길이 필터링
-min_len, max_len = 5, 50  # 최소 및 최대 길이 설정
-df = df[df['source'].str.split().apply(len).between(min_len, max_len)]
-df = df[df['eTranslation'].str.split().apply(len).between(min_len, max_len)]
+# -------------------------
+# 2. 의존 구문 분석 + 핵심 관계 추출
+# -------------------------
+nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])  # NER, 분류 비활성화 → 속도 향상
 
-# 토크나이저 설정
-tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+def dependency_graph(sentence, min_words=12):
+    """ 핵심 관계를 확장하여 정보 손실 방지 """
+    doc = nlp(sentence)
+    filtered_words = []
 
-# 토큰화
-source_tokenized = tokenizer(df['source'].tolist(), padding=True, truncation=True, max_length=128, return_tensors="pt")
-target_tokenized = tokenizer(df['eTranslation'].tolist(), padding=True, truncation=True, max_length=128, return_tensors="pt")
+    for token in doc:
+        if token.dep_ in ["nsubj", "prep", "amod", "dobj", "ROOT", "advmod", "pobj", "attr", "ccomp", "acl", "xcomp", "nmod", "conj", "appos"]:
+            filtered_words.append(token.text)
 
-# 데이터셋 클래스 정의 (수정 2번 째)
-class TranslationDataset(Dataset):
-    def __init__(self, source, target, source_mask, target_mask):
-        self.source = source['input_ids']
-        self.target = target['input_ids']
-        self.source_mask = source_mask  # 추가
-        self.target_mask = target_mask  # 추가
+    return " ".join(filtered_words) if len(filtered_words) >= min_words else sentence
 
-    def __len__(self):
-        return len(self.source)
 
-    def __getitem__(self, idx):
-        return {
-            'input_ids': self.source[idx],
-            'labels': self.target[idx],
-            'attention_mask': self.source_mask[idx],  # 추가
-            'label_mask': self.target_mask[idx]  # 추가
-        }
+if __name__ == '__main__':  # Windows 환경에서 필수!
+    # -------------------------
+    # 1. 파일 경로 설정 & 데이터 로드
+    # -------------------------
+    base_path = os.path.dirname(os.path.abspath(__file__))  
+    csv_file = os.path.join(base_path, "Data", "WMT21_en_de.csv")
+    df = pd.read_csv(csv_file)
 
-# 데이터셋 분리 후 리스트로 변환
-train_size = 0.8
-train_src, val_src, train_tgt, val_tgt = train_test_split(
-    df['source'].tolist(), df['eTranslation'].tolist(), train_size=train_size, random_state=42
-)
+    # 필요한 열 추출
+    df = df[['source', 'eTranslation']]
 
-train_src_tokenized = tokenizer(train_src, padding=True, truncation=True, return_tensors="pt")
-train_tgt_tokenized = tokenizer(train_tgt, padding=True, truncation=True, return_tensors="pt")
-val_src_tokenized = tokenizer(val_src, padding=True, truncation=True, return_tensors="pt")
-val_tgt_tokenized = tokenizer(val_tgt, padding=True, truncation=True, return_tensors="pt")
+    def clean_sentence(sentence):
+        return sentence.strip().lower()
 
-# DataLoader 생성에 필요한 TranslationDataset
-train_dataset = TranslationDataset(
-    train_src_tokenized, train_tgt_tokenized,
-    train_src_tokenized['attention_mask'], train_tgt_tokenized['attention_mask']
-)
-val_dataset = TranslationDataset(
-    val_src_tokenized, val_tgt_tokenized,
-    val_src_tokenized['attention_mask'], val_tgt_tokenized['attention_mask']
-)
+    df['source'] = df['source'].apply(lambda x: dependency_graph(x, min_words=8))
+    df['eTranslation'] = df['eTranslation'].apply(lambda x: dependency_graph(x, min_words=8))
 
+    # -------------------------
+    # 3. 문장 길이 필터링
+    # -------------------------
+    min_len, max_len = 5, 30  # 문장 최소 길이 조정하여 너무 짧은 문장 제거
+    df = df[df['source'].str.len().between(min_len, max_len)]
+    df = df[df['eTranslation'].str.len().between(min_len, max_len)]
+
+    # 빈 값이 있는 행 제거 (에러 방지)
+    df.dropna(subset=['source', 'eTranslation'], inplace=True)
+
+    # -------------------------
+    # 4. 토크나이저 설정 및 Dataset 생성
+    # -------------------------
+    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+
+    class TranslationDataset(Dataset):
+        def __init__(self, sources, targets, tokenizer, max_length=64):
+            self.sources = sources
+            self.targets = targets
+            self.tokenizer = tokenizer
+            self.max_length = max_length
+
+        def __len__(self):
+            return len(self.sources)
+
+        def __getitem__(self, idx):
+            source_text = self.sources[idx]
+            target_text = self.targets[idx]
+
+            encoded = self.tokenizer(
+                [source_text, target_text],  
+                padding='max_length',
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt"
+            )
+
+            return {
+                'input_ids': encoded['input_ids'][0],
+                'attention_mask': encoded['attention_mask'][0],
+                'labels': encoded['input_ids'][1],
+                'label_mask': encoded['attention_mask'][1]
+            }
+
+    # -------------------------
+    # 5. Train / Validation 분리 및 DataLoader 추가
+    # -------------------------
+    train_src, val_src, train_tgt, val_tgt = train_test_split(
+        df['source'].tolist(),
+        df['eTranslation'].tolist(),
+        train_size=0.8,
+        random_state=42
+    )
+
+    train_dataset = TranslationDataset(train_src, train_tgt, tokenizer, max_length=16)
+    val_dataset = TranslationDataset(val_src, val_tgt, tokenizer, max_length=16)
+
+    # DataLoader 추가 (최종 학습에 필요)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+    sample_batch = next(iter(train_loader))
+
+    print("Input IDs:", sample_batch['input_ids'][0])  # 첫 번째 샘플
+    print("Attention Mask:", sample_batch['attention_mask'][0])
+    print("Labels:", sample_batch['labels'][0])
+'''
+
+import os
+import json
+import pandas as pd
+import spacy
+from sklearn.model_selection import train_test_split
+
+# -------------------------
+# 1. 파일 경로 설정 & 데이터 로드
+# -------------------------
+base_path = os.path.dirname(os.path.abspath(__file__))  
+csv_file = os.path.join(base_path, "Data", "WMT21_en_de.csv")
+df = pd.read_csv(csv_file)
+
+# 필요한 열 추출
+df = df[['source', 'eTranslation']]
+
+# -------------------------
+# 2. 데이터 전처리: 의존 구문 분석 적용
+# -------------------------
+nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])  # 속도 향상을 위해 불필요한 태스크 제거
+
+def dependency_graph(sentence, min_words=8):
+    """ 핵심 관계를 추출하는 의존 구문 분석 수행 """
+    doc = nlp(sentence)
+    filtered_words = []
+
+    for token in doc:
+        if token.dep_ in ["nsubj", "prep", "amod", "dobj", "ROOT", "advmod", "pobj", "attr", "ccomp", "acl", "xcomp", "nmod", "conj", "appos"]:
+            filtered_words.append(token.text)
+
+    return " ".join(filtered_words) if len(filtered_words) >= min_words else sentence
+
+df['source_processed'] = df['source'].apply(lambda x: dependency_graph(x, min_words=8))
+df['eTranslation_processed'] = df['eTranslation'].apply(lambda x: dependency_graph(x, min_words=8))
+
+# -------------------------
+# 3. 데이터 저장 (JSON 형식)
+# -------------------------
+output_file = os.path.join(base_path, "processed_data.json")
+
+data_dict = {
+    "source": df['source'].tolist(),
+    "source_processed": df['source_processed'].tolist(),
+    "eTranslation": df['eTranslation'].tolist(),
+    "eTranslation_processed": df['eTranslation_processed'].tolist()
+}
+
+with open(output_file, "w", encoding="utf-8") as f:
+    json.dump(data_dict, f, indent=4, ensure_ascii=False)
